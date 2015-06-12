@@ -1,0 +1,173 @@
+#!/usr/bin/env python
+from gen import get_jo, generate_cmd, d3pd_cmd, flat2_cmd, flat_cmd
+from gen import SEEDS, MASSES, DSIDS, PROD_DIR
+from gen.cmd import get_dir_mode, get_dir_mass
+from gen.cmd import JO_PATTERN
+
+import os
+import re
+import cluster
+import subprocess
+from argparse import ArgumentParser
+
+# PARSER
+parser = ArgumentParser(os.path.basename(__file__))
+parser.add_argument('action', type=str, choices=['gen', 'd3pd', 'flat', 'flat2', 'clean']) 
+parser.add_argument('--dry', action='store_true', default=False)
+parser.add_argument('--mode', nargs='*', default=['VBF', 'gg'], choices=['VBF', 'gg'])
+parser.add_argument('--mass', type=int, default=-1)
+parser.add_argument('--events', type=int, default=5000, help='Number of event to generate per chunk')
+parser.add_argument('--chunks', type=int, default=1, help='Chunks of event generation')
+
+args = parser.parse_args()
+print args
+
+if args.mass in MASSES:
+    masses = [args.mass]
+elif args.mass == -1:
+    masses = MASSES
+else:
+    raise RuntimeError('Wrong mass argument!')
+
+# qsub setup
+setup = cluster.get_setup(os.path.join(
+        os.path.dirname(cluster.__file__), 'setup.sfu.txt'))
+setup_root_only = cluster.get_setup(os.path.join(
+        os.path.dirname(cluster.__file__), 'setup.sfu.root.txt'))
+log_dir = os.path.join(os.getcwd(), 'log')
+
+def submit_cluster(cmd, name, setup=setup):
+    cmd = "cd %s && %s && %s" % (os.getcwd(), setup, cmd)
+    cluster.qsub(
+        cmd, name=name, 
+        stderr_path=log_dir, 
+        stdout_path=log_dir, 
+        dry_run=args.dry)
+
+
+# 1) Event generation block
+if args.action == 'gen':
+    for dirpath, _, files in os.walk(PROD_DIR):
+        if dirpath != PROD_DIR:
+            break
+
+        for m, dsid in zip(MASSES, DSIDS):
+            if not m in masses:
+                continue
+
+            print '=' * 50
+            gen_cmds = {}
+            for mode in args.mode:
+                jo = get_jo(m, mode)
+                jo_name = 'MC12.{0}.PowhegPythia8_AU2CT10_{1}H{2}_tautau.py'.format(
+                    dsid, mode, m)
+                print jo_name
+                with open(os.path.join('joboptions', jo_name), 'w') as f:
+                    f.write(jo)
+
+                # GEN COMMAND
+                for ichunk, seed in enumerate(SEEDS):
+                    if ichunk < args.chunks:
+                        cmd = generate_cmd(jo_name, seed=seed, nevents=args.events)
+                        name = jo_name + '_' + str(seed)
+                        gen_cmds[name] = cmd
+        
+            print '-' * 20
+            for name, cmd in gen_cmds.items():
+                try:
+                    submit_cluster(cmd, name)
+                except KeyboardInterrupt:
+                    break
+
+
+# 2) EVNT -> TRUTH_NTUP step
+if args.action == 'd3pd':
+    for dirpath, dirnames, files in os.walk(PROD_DIR):
+        if dirpath != PROD_DIR:
+            break
+        
+        dirnames = filter(lambda d: get_dir_mode(d) in args.mode, dirnames)
+        if args.mass != -1:
+            dirnames = filter(lambda d: get_dir_mass(d) in masses, dirnames)
+        print dirnames
+        d3pd_cmds = {}
+        for d in dirnames:
+            for f in os.listdir(os.path.join(PROD_DIR, d)):
+                if f[0:4] == 'EVNT':
+                    cmd = d3pd_cmd(os.path.join(PROD_DIR, d), f)
+                    name = '_'.join([args.action, d, f])
+                    d3pd_cmds[name] = cmd
+
+        print d3pd_cmds.keys()
+        for name, cmd in d3pd_cmds.items():
+            try:
+                submit_cluster(cmd,name)
+            except KeyboardInterrupt:
+                break
+
+# 3) TRUTH_NTUP -> FLAT step
+if args.action == 'flat': 
+    print 'DEPRECATED flattening code ! Will be soon completly disabled'
+
+if args.action == 'flat2':
+
+    for dirpath, dirnames, files in os.walk(PROD_DIR):
+        if dirpath != PROD_DIR:
+            break
+        
+        dirnames = filter(lambda d: get_dir_mode(d) in args.mode, dirnames)
+        if args.mass != -1:
+            dirnames = filter(lambda d: get_dir_mass(d) in masses, dirnames)
+        flat_cmds = {}
+        for d in dirnames:
+            for f in os.listdir(os.path.join(PROD_DIR, d)):
+                if f[0:4] == 'ntup' and '.root' in f:
+                    cmd = flat2_cmd(d, f)
+                    name = '_'.join([args.action, d, f])
+                    flat_cmds[name] = cmd
+
+        print flat_cmds.keys()
+        for name, cmd in flat_cmds.items():
+            try:
+                submit_cluster(cmd,name, setup=setup_root_only)
+            except KeyboardInterrupt:
+                break
+
+# 4) CLEANING
+if args.action == 'clean':
+    for dirpath, dirnames, files in os.walk(PROD_DIR):
+        if dirpath != PROD_DIR:
+            break
+        
+        dirnames = filter(lambda d: get_dir_mode(d) in args.mode, dirnames)
+        if args.mass != -1:
+            dirnames = filter(lambda d: get_dir_mass(d) in masses, dirnames)
+        clean_cmds = {}
+
+        KEEP_PATTERNS = ['EVNT', 'flat', 'ntup']
+        KEEP_FILES = ['Generate.log']
+
+        def rm_file(f):
+            if f[0:4] in KEEP_PATTERNS and '.root' in f:
+                return False
+            elif f in KEEP_FILES:
+                return False
+            elif re.match(JO_PATTERN, f):
+                return False
+            else:
+                return True
+
+        for d in dirnames:
+            files = os.listdir(os.path.join(PROD_DIR, d))
+            files = filter(lambda f: rm_file(f), files)
+            for f in files:
+                cmd = 'rm -rf {0}'.format(os.path.join(
+                        PROD_DIR, d, f))
+                name = '_'.join([args.action, d, f])
+                clean_cmds[name] = cmd
+
+        for _, cmd in clean_cmds.items():
+            if args.dry:
+                print cmd
+            else:
+                subprocess.call(cmd, shell=True)
